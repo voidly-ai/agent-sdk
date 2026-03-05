@@ -1,0 +1,16 @@
+{
+  "name": "voidly-agent-sdk-examples",
+  "private": true,
+  "type": "module",
+  "description": "Working examples for @voidly/agent-sdk",
+  "scripts": {
+    "quickstart": "node quickstart.mjs",
+    "channel": "node encrypted-channel.mjs",
+    "rpc": "node rpc.mjs",
+    "conversation": "node conversation.mjs",
+    "monitor": "node censorship-monitor.mjs"
+  },
+  "dependencies": {
+    "@voidly/agent-sdk": "^3.2.1"
+  }
+}

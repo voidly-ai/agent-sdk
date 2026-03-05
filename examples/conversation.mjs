@@ -4,10 +4,11 @@
  * Threaded dialog between two agents with waitForReply.
  * Each conversation tracks its own thread.
  *
- * Run: node examples/conversation.mjs
+ * Run: npm run conversation (or: node examples/conversation.mjs)
  */
 import { VoidlyAgent } from '@voidly/agent-sdk';
 
+try {
 const analyst = await VoidlyAgent.register({ name: 'analyst' });
 const reviewer = await VoidlyAgent.register({ name: 'reviewer' });
 
@@ -48,3 +49,7 @@ for (const msg of history) {
 // Clean up
 await analyst.deactivate();
 await reviewer.deactivate();
+} catch (err) {
+  console.error('Error:', err.message);
+  process.exit(1);
+}

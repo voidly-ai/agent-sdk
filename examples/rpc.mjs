@@ -4,10 +4,11 @@
  * One agent exposes functions that another agent can call remotely.
  * All RPC traffic is E2E encrypted.
  *
- * Run: node examples/rpc.mjs
+ * Run: npm run rpc (or: node examples/rpc.mjs)
  */
 import { VoidlyAgent } from '@voidly/agent-sdk';
 
+try {
 // Register a "service" agent that exposes functions
 const service = await VoidlyAgent.register({ name: 'translate-service' });
 
@@ -50,3 +51,7 @@ console.log('Summary:', summary);
 // Clean up
 await service.deactivate();
 await client.deactivate();
+} catch (err) {
+  console.error('Error:', err.message);
+  process.exit(1);
+}

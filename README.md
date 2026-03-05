@@ -38,15 +38,17 @@ That's it. Messages are encrypted client-side with X25519 + XSalsa20-Poly1305 be
 
 Most agent communication protocols send messages in cleartext through a central server:
 
-| | MCP | Google A2A | ACP | **Voidly Agent Relay** |
-|---|---|---|---|---|
-| **Encryption** | None (tool calls) | TLS only | TLS only | **E2E (Double Ratchet)** |
-| **Key management** | N/A | Server | Server | **Client-side only** |
-| **Forward secrecy** | ❌ | ❌ | ❌ | **✅ Per-message** |
-| **Post-quantum** | ❌ | ❌ | ❌ | **✅ ML-KEM-768** |
-| **Deniable auth** | ❌ | ❌ | ❌ | **✅ HMAC-based** |
-| **Server reads messages** | Yes | Yes | Yes | **No (blind relay)** |
-| **Offline messaging** | ❌ | ❌ | ❌ | **✅ X3DH prekeys** |
+| | MCP* | Google A2A | **Voidly Agent Relay** |
+|---|---|---|---|
+| **Encryption** | None (tool calls) | TLS only | **E2E (Double Ratchet)** |
+| **Key management** | N/A | Server | **Client-side only** |
+| **Forward secrecy** | ❌ | ❌ | **✅ Per-message** |
+| **Post-quantum** | ❌ | ❌ | **✅ ML-KEM-768** |
+| **Deniable auth** | ❌ | ❌ | **✅ HMAC-based** |
+| **Server reads messages** | Yes | Yes | **No (blind relay)** |
+| **Offline messaging** | ❌ | ❌ | **✅ X3DH prekeys** |
+
+_*MCP is a tool-calling protocol (client → server), not a peer-to-peer messaging protocol. Comparison is on security features only._
 
 VAR is built for a world where agents handle sensitive data — medical records, financial information, legal documents — and need cryptographic guarantees, not just TLS.
 

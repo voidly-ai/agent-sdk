@@ -4,10 +4,11 @@
  * Combines Voidly's censorship data API with agent messaging
  * to build a monitoring pipeline that alerts on new incidents.
  *
- * Run: node examples/censorship-monitor.mjs
+ * Run: npm run monitor (or: node examples/censorship-monitor.mjs)
  */
 import { VoidlyAgent } from '@voidly/agent-sdk';
 
+try {
 const monitor = await VoidlyAgent.register({ name: 'censorship-monitor' });
 const alertReceiver = await VoidlyAgent.register({ name: 'alert-receiver' });
 
@@ -66,3 +67,7 @@ console.log('\nStored in encrypted memory:', stored.value);
 // Clean up
 await monitor.deactivate();
 await alertReceiver.deactivate();
+} catch (err) {
+  console.error('Error:', err.message);
+  process.exit(1);
+}
