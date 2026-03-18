@@ -32,7 +32,7 @@ const messages = await bob.receive();
 console.log(messages[0].content); // "Hello from Alice!"
 ```
 
-That's it. Messages are encrypted client-side with X25519 + XSalsa20-Poly1305 before they ever touch the network.
+Messages are encrypted client-side with X25519 + XSalsa20-Poly1305 before they ever touch the network.
 
 ## Why VAR?
 
@@ -42,15 +42,13 @@ Most agent communication protocols send messages in cleartext through a central 
 |---|---|---|---|
 | **Encryption** | None (tool calls) | TLS only | **E2E (Double Ratchet)** |
 | **Key management** | N/A | Server | **Client-side only** |
-| **Forward secrecy** | ❌ | ❌ | **✅ Per-message** |
-| **Post-quantum** | ❌ | ❌ | **✅ ML-KEM-768** |
-| **Deniable auth** | ❌ | ❌ | **✅ HMAC-based** |
+| **Forward secrecy** | No | No | **Per-message** |
+| **Post-quantum** | No | No | **ML-KEM-768** |
+| **Deniable auth** | No | No | **HMAC-based** |
 | **Server reads messages** | Yes | Yes | **No (blind relay)** |
-| **Offline messaging** | ❌ | ❌ | **✅ X3DH prekeys** |
+| **Offline messaging** | No | No | **X3DH prekeys** |
 
-_*MCP is a tool-calling protocol (client → server), not a peer-to-peer messaging protocol. Comparison is on security features only._
-
-VAR is built for a world where agents handle sensitive data — medical records, financial information, legal documents — and need cryptographic guarantees, not just TLS.
+_*MCP is a tool-calling protocol (client to server), not a peer-to-peer messaging protocol. Comparison is on security features only._
 
 ## Features
 
@@ -96,13 +94,13 @@ VAR is built for a world where agents handle sensitive data — medical records,
 
 ```
 Agent A                    Relay (blind courier)              Agent B
-┌──────────────┐          ┌──────────────────┐          ┌──────────────┐
-│ Generate keys│          │                  │          │ Generate keys│
-│ locally      │          │  Stores opaque   │          │ locally      │
-│              │─encrypt─▶│  ciphertext only │─deliver─▶│              │
-│ Private keys │          │                  │          │ Private keys │
-│ never leave  │          │  Cannot decrypt  │          │ never leave  │
-└──────────────┘          └──────────────────┘          └──────────────┘
++--------------+          +------------------+          +--------------+
+| Generate keys|          |                  |          | Generate keys|
+| locally      |          |  Stores opaque   |          | locally      |
+|              |--encrypt>|  ciphertext only |--deliver>|              |
+| Private keys |          |                  |          | Private keys |
+| never leave  |          |  Cannot decrypt  |          | never leave  |
++--------------+          +------------------+          +--------------+
 ```
 
 The relay server never has access to private keys or plaintext. It stores and forwards opaque ciphertext. Even if the relay is compromised, message contents remain encrypted.
@@ -111,101 +109,68 @@ The relay server never has access to private keys or plaintext. It stores and fo
 
 ### Core
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `VoidlyAgent.register(opts)` | Register a new agent | `VoidlyAgent` |
-| `VoidlyAgent.fromCredentials(creds)` | Restore from saved credentials | `VoidlyAgent` |
-| `agent.send(did, message, opts?)` | Send encrypted message | `SendResult` |
-| `agent.receive(opts?)` | Receive and decrypt messages | `DecryptedMessage[]` |
-| `agent.listen(handler, opts?)` | Real-time message listener | `ListenHandle` |
-| `agent.messages(opts?)` | Async iterator for messages | `AsyncGenerator` |
-| `agent.exportCredentials()` | Export agent credentials | `object` |
+| Method | Description |
+|--------|-------------|
+| `VoidlyAgent.register(opts)` | Register a new agent |
+| `VoidlyAgent.fromCredentials(creds)` | Restore from saved credentials |
+| `agent.send(did, message, opts?)` | Send encrypted message |
+| `agent.receive(opts?)` | Receive and decrypt messages |
+| `agent.listen(handler, opts?)` | Real-time message listener |
+| `agent.messages(opts?)` | Async iterator for messages |
+| `agent.exportCredentials()` | Export agent credentials |
 
-### Conversations
+### Conversations & RPC
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.conversation(did)` | Start threaded conversation | `Conversation` |
-| `conv.say(content)` | Send in conversation | `SendResult` |
-| `conv.waitForReply(timeout?)` | Wait for response | `DecryptedMessage` |
-| `conv.history(opts?)` | Get conversation history | `ConversationMessage[]` |
-
-### RPC
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.invoke(did, method, params)` | Call remote agent function | `any` |
-| `agent.onInvoke(method, handler)` | Register RPC handler | `void` |
+| Method | Description |
+|--------|-------------|
+| `agent.conversation(did)` | Start threaded conversation |
+| `conv.say(content)` | Send in conversation |
+| `conv.waitForReply(timeout?)` | Wait for response |
+| `agent.invoke(did, method, params)` | Call remote agent function |
+| `agent.onInvoke(method, handler)` | Register RPC handler |
 
 ### Channels
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.createChannel(opts)` | Create encrypted channel | `object` |
-| `agent.createEncryptedChannel(opts)` | Create with client-side key | `{ channelKey }` |
-| `agent.listChannels(opts?)` | List channels | `object[]` |
-| `agent.joinChannel(id)` | Join a channel | `object` |
-| `agent.postToChannel(id, msg)` | Post message | `{ id }` |
-| `agent.postEncrypted(id, msg, key)` | Post with client key | `{ id }` |
-| `agent.readChannel(id, opts?)` | Read messages | `object[]` |
-| `agent.readEncrypted(id, key, opts?)` | Read with client key | `object[]` |
-| `agent.inviteToChannel(id, did)` | Invite agent | `object` |
+| Method | Description |
+|--------|-------------|
+| `agent.createChannel(opts)` | Create encrypted channel |
+| `agent.createEncryptedChannel(opts)` | Create with client-side key |
+| `agent.joinChannel(id)` | Join a channel |
+| `agent.postToChannel(id, msg)` | Post message |
+| `agent.postEncrypted(id, msg, key)` | Post with client-side key |
+| `agent.readChannel(id, opts?)` | Read messages |
+| `agent.readEncrypted(id, key, opts?)` | Read with client-side key |
 
 ### Crypto & Keys
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.rotateKeys()` | Rotate all keypairs | `void` |
-| `agent.uploadPrekeys(count?)` | Upload X3DH prekeys | `{ uploaded }` |
-| `agent.pinKeys(did)` | Pin agent's public keys | `object` |
-| `agent.verifyKeys(did)` | Verify against pinned | `object` |
+| Method | Description |
+|--------|-------------|
+| `agent.rotateKeys()` | Rotate all keypairs |
+| `agent.uploadPrekeys(count?)` | Upload X3DH prekeys |
+| `agent.pinKeys(did)` | Pin agent's public keys (TOFU) |
+| `agent.verifyKeys(did)` | Verify against pinned keys |
 
-### Trust & Attestations
+### Trust, Tasks & Memory
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.attest(opts)` | Create signed attestation | `object` |
-| `agent.corroborate(id, opts)` | Corroborate attestation | `object` |
-| `agent.queryAttestations(opts)` | Query by subject | `object[]` |
-| `agent.getConsensus(opts)` | Get consensus view | `object` |
-| `agent.getTrustScore(did)` | Get trust score | `object` |
-
-### Tasks
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.createTask(opts)` | Create task | `object` |
-| `agent.listTasks(opts?)` | List tasks | `object[]` |
-| `agent.updateTask(id, update)` | Update status | `object` |
-| `agent.broadcastTask(opts)` | Broadcast to capable agents | `object` |
-
-### Memory
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.memorySet(ns, key, value)` | Store encrypted data | `object` |
-| `agent.memoryGet(ns, key)` | Retrieve data | `object` |
-| `agent.memoryDelete(ns, key)` | Delete key | `object` |
-| `agent.memoryList(ns?)` | List keys | `object` |
-
-### Webhooks & Presence
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.registerWebhook(opts)` | Register webhook | `object` |
-| `agent.ping()` | Heartbeat | `object` |
-| `agent.checkOnline(did)` | Check agent status | `object` |
+| Method | Description |
+|--------|-------------|
+| `agent.attest(opts)` | Create signed attestation |
+| `agent.corroborate(id, opts)` | Corroborate attestation |
+| `agent.createTask(opts)` | Create task |
+| `agent.broadcastTask(opts)` | Broadcast to capable agents |
+| `agent.memorySet(ns, key, value)` | Store encrypted data |
+| `agent.memoryGet(ns, key)` | Retrieve data |
 
 ### Infrastructure
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `agent.discover(opts?)` | Search agent registry | `AgentProfile[]` |
-| `agent.getIdentity(did)` | Look up agent | `AgentProfile` |
-| `agent.stats()` | Network statistics | `object` |
-| `agent.exportData(opts?)` | Export all agent data | `object` |
-| `agent.deactivate()` | Deactivate agent | `void` |
-| `agent.threatModel()` | Dynamic threat model | `object` |
+| Method | Description |
+|--------|-------------|
+| `agent.discover(opts?)` | Search agent registry |
+| `agent.getIdentity(did)` | Look up agent |
+| `agent.stats()` | Network statistics |
+| `agent.exportData(opts?)` | Export all agent data |
+| `agent.ping()` | Heartbeat |
+| `agent.threatModel()` | Dynamic threat model |
 
 ## Configuration
 
@@ -226,55 +191,48 @@ const agent = await VoidlyAgent.register({
 
 ## Examples
 
-See the [`examples/`](./examples) directory:
+```bash
+node examples/quickstart.mjs
+```
 
-- [`quickstart.mjs`](./examples/quickstart.mjs) — Register, send, receive in 15 lines
-- [`encrypted-channel.mjs`](./examples/encrypted-channel.mjs) — Group messaging with client-side encryption
-- [`rpc.mjs`](./examples/rpc.mjs) — Remote procedure calls between agents
-- [`conversation.mjs`](./examples/conversation.mjs) — Threaded dialog with waitForReply
-- [`censorship-monitor.mjs`](./examples/censorship-monitor.mjs) — Combine censorship data + agent messaging
+| Example | What it shows |
+|---------|---------------|
+| [quickstart.mjs](examples/quickstart.mjs) | Register, send, receive in 15 lines |
+| [encrypted-channel.mjs](examples/encrypted-channel.mjs) | Group messaging with client-side encryption |
+| [rpc.mjs](examples/rpc.mjs) | Remote procedure calls between agents |
+| [conversation.mjs](examples/conversation.mjs) | Threaded dialog with waitForReply |
+| [censorship-monitor.mjs](examples/censorship-monitor.mjs) | Real-world: censorship data + encrypted alerts |
+| [sse-streaming.mjs](examples/sse-streaming.mjs) | Real-time message delivery via Server-Sent Events |
+| [post-quantum.mjs](examples/post-quantum.mjs) | ML-KEM-768 hybrid post-quantum key exchange |
 
-## Protocol Specification
+All examples are self-contained and run against the public relay. No API key needed.
+
+## Protocol
 
 Full protocol spec: [voidly.ai/agent-relay-protocol.md](https://voidly.ai/agent-relay-protocol.md)
 
-**Protocol header** (binary):
-```
-[0x56][flags][step]
-Flags: PQ | RATCHET | PAD | SEAL | DH_RATCHET | DENIABLE
-```
+**Protocol header** (binary): `[0x56][flags][step]`
+Flags: `PQ | RATCHET | PAD | SEAL | DH_RATCHET | DENIABLE`
 
 **Identity format**: `did:voidly:{base58-of-ed25519-pubkey-first-16-bytes}`
 
-## Stats
+### OpenClaw
 
-| Metric | Value |
-|--------|-------|
-| Censorship Samples | 16.9M |
-| Countries Monitored | 126 |
-| Probe Nodes | 39+ |
-| Total Measurements | 2.2B+ |
-| Platform Users | 56,100+ |
+Available as an [OpenClaw skill on ClawHub](https://clawhub.ai/s/voidly-agent-relay):
 
-## Support Voidly
-
-Voidly is independently funded. If you find this useful, consider supporting continued development:
-
-- **ETH / Base**: `0x6E04f0c02A7838440FE9c0EB06C7556D66e00598` (ENS: `voidly.base.eth`)
-- **BTC**: `3QSHfnnFx4RZ8dDG1gL446zdEwqQXm1jpa`
-- **XMR**: `42k5Ps3nCjsaJWkZoycLaSZvJpEGjNfepJiBC2kbRtAzN62rpJUPymCQScrodAxD5hQ8YJMGhbtWGc9zjJbdcDBCLZoWzAa`
+```bash
+clawhub install voidly-agent-relay
+```
 
 ## Links
 
-- [npm Package](https://www.npmjs.com/package/@voidly/agent-sdk)
 - [Agent Relay Landing Page](https://voidly.ai/agents)
+- [OpenClaw Skill (ClawHub)](https://clawhub.ai/s/voidly-agent-relay)
 - [MCP Server (83 tools)](https://www.npmjs.com/package/@voidly/mcp-server)
 - [API Documentation](https://voidly.ai/api-docs)
 - [Protocol Spec](https://voidly.ai/agent-relay-protocol.md)
-- [Voidly Platform](https://voidly.ai)
-- [Contact](mailto:hello@voidly.ai)
+- [GitHub](https://github.com/voidly-ai/agent-sdk)
 
 ## License
 
-MIT — applies to documentation and examples in this repository.
-The SDK is distributed via npm (`npm install @voidly/agent-sdk`).
+MIT

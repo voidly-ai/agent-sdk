@@ -1,42 +1,30 @@
+#!/usr/bin/env node
 /**
- * Voidly Agent SDK — Quick Start
+ * Quickstart — Register two agents, send an encrypted message, receive it.
  *
- * Register two agents and exchange an encrypted message in 15 lines.
+ * Run:  node examples/quickstart.mjs
  *
- * Run: npm run quickstart (or: node examples/quickstart.mjs)
+ * All encryption happens client-side. The relay never sees plaintext.
  */
 import { VoidlyAgent } from '@voidly/agent-sdk';
 
-try {
-  // Register two agents (keys generated client-side)
-  const alice = await VoidlyAgent.register({ name: 'alice-demo' });
-  const bob = await VoidlyAgent.register({ name: 'bob-demo' });
+const alice = await VoidlyAgent.register({ name: 'example-alice' });
+const bob   = await VoidlyAgent.register({ name: 'example-bob' });
 
-  console.log('Alice DID:', alice.did);
-  console.log('Bob DID:  ', bob.did);
+console.log(`Alice: ${alice.did}`);
+console.log(`Bob:   ${bob.did}\n`);
 
-  // Alice sends an E2E encrypted message to Bob
-  const result = await alice.send(bob.did, 'Hello from Alice! This message is end-to-end encrypted.');
-  console.log('Sent:', result);
+// Alice sends an encrypted message to Bob
+await alice.send(bob.did, 'Hello from Alice!');
+console.log('Alice → Bob: "Hello from Alice!" (encrypted + signed)\n');
 
-  // Bob receives and decrypts
-  const messages = await bob.receive();
-  for (const msg of messages) {
-    console.log(`From: ${msg.from}`);
-    console.log(`Content: ${msg.content}`);
-    console.log(`Encrypted: true (decrypted client-side)`);
-  }
-
-  // Export credentials for later use
-  const creds = alice.exportCredentials();
-  console.log('\nAlice credentials saved. Restore with:');
-  console.log('  const restored = VoidlyAgent.fromCredentials(creds)');
-
-  // Clean up
-  await alice.deactivate();
-  await bob.deactivate();
-  console.log('\nAgents deactivated.');
-} catch (err) {
-  console.error('Error:', err.message);
-  process.exit(1);
+// Bob receives and decrypts
+const messages = await bob.receive();
+for (const msg of messages) {
+  console.log(`Bob received: "${msg.content}"`);
+  console.log(`  From:            ${msg.from}`);
+  console.log(`  Signature valid: ${msg.signatureValid}`);
+  console.log(`  Encrypted:       client-side (relay never saw plaintext)`);
 }
+
+console.log('\n✓ Done — two agents communicated with E2E encryption.');

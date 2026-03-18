@@ -106,6 +106,12 @@ export interface VoidlyAgentConfig {
   /** Transport preference for listen() — tries in order, falls back automatically
    * Default: ['sse', 'long-poll']. Options: 'websocket' | 'sse' | 'long-poll' */
   transport?: ('websocket' | 'sse' | 'long-poll')[];
+
+  // ── Ratchet Recovery (v3.3) ──────────────────────────────────────────────
+  /** Auto-reset ratchet after N consecutive decrypt failures from same peer (default: 10, 0 = disabled) */
+  autoResetThreshold?: number;
+  /** Callback when a ratchet is auto-reset due to consecutive failures */
+  onRatchetReset?: (peerDid: string, failCount: number) => void;
 }
 
 // ─── Listen & Conversation Types ─────────────────────────────────────────────
@@ -272,7 +278,7 @@ interface UnsealedEnvelope {
 function unsealEnvelope(plaintext: string): UnsealedEnvelope | null {
   try {
     const parsed = JSON.parse(plaintext);
-    if ((parsed.v === 2 || parsed.v === 3) && parsed.from && parsed.msg) {
+    if ((parsed.v === 2 || parsed.v === 3) && parsed.from && parsed.msg !== undefined) {
       const result: UnsealedEnvelope = { from: parsed.from, msg: parsed.msg, ts: parsed.ts };
       // Extract packed metadata (v3)
       if (parsed.ct) result.contentType = parsed.ct;
@@ -362,7 +368,7 @@ interface RatchetPeerState {
   dhSkippedKeys?: Map<string, Uint8Array>; // "base64DhPub:step" → messageKey
 }
 
-const MAX_SKIP = 200; // Max skipped keys to cache (prevents DoS)
+const MAX_SKIP = 1000; // Max skipped keys to cache (Signal uses 2000)
 
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 function toBase58(bytes: Uint8Array): string {
@@ -432,6 +438,10 @@ export class VoidlyAgent {
   private _identityCache: Map<string, { profile: AgentProfile; cachedAt: number }> = new Map();
   private _seenMessageIds: Set<string> = new Set();
   private _decryptFailCount: number = 0;
+  /** Per-peer consecutive decrypt failure tracking for auto-recovery */
+  private _peerDecryptFails: Map<string, number> = new Map();
+  /** Max consecutive per-peer decrypt failures before auto-resetting ratchet (0 = disabled) */
+  private _autoResetThreshold: number = 10;
   // RPC handlers: method → handler function
   private _rpcHandlers: Map<string, (params: any, caller: string) => Promise<any>> = new Map();
   // RPC pending responses: rpc_id → { resolve, reject, timer }
@@ -448,6 +458,12 @@ export class VoidlyAgent {
   private _persistKey: Uint8Array | null = null;
   // Transport preference (v3.2)
   private _transportPrefs: string[];
+  // Ratchet recovery callback (v3.3)
+  private _onRatchetReset?: (peerDid: string, failCount: number) => void;
+  // v3.4.2: Per-peer send mutex — prevents concurrent send() from deriving identical chain keys
+  private _sendLocks: Map<string, Promise<void>> = new Map();
+  // v3.4.2: Global decrypt mutex — prevents concurrent _decryptMessages from corrupting ratchet state
+  private _decryptLock: Promise<void> | null = null;
 
   private constructor(identity: AgentIdentity, config?: VoidlyAgentConfig) {
     this.did = identity.did;
@@ -476,6 +492,9 @@ export class VoidlyAgent {
     this._persistPath = config?.persistPath;
     // Transport
     this._transportPrefs = config?.transport || ['sse', 'long-poll'];
+    // Ratchet recovery
+    this._autoResetThreshold = config?.autoResetThreshold ?? 10;
+    this._onRatchetReset = config?.onRatchetReset;
   }
 
   // ─── Factory Methods ────────────────────────────────────────────────────────
@@ -563,12 +582,14 @@ export class VoidlyAgent {
       sendChainKey: string; sendStep: number; recvChainKey: string; recvStep: number;
       rootKey?: string; dhSendSecretKey?: string; dhSendPublicKey?: string;
       dhRecvPubKey?: string; prevSendStep?: number;
+      skippedKeys?: Record<string, string>; dhSkippedKeys?: Record<string, string>;
     }>;
     mlkemPublicKey?: string;
     mlkemSecretKey?: string;
     signedPrekeySecret?: string;
     signedPrekeyPublic?: string;
     signedPrekeyId?: number;
+    peerDecryptFails?: Record<string, number>;
   }, config?: VoidlyAgentConfig): VoidlyAgent {
     // Validate required fields
     if (!creds.did || !creds.did.startsWith('did:')) {
@@ -613,6 +634,13 @@ export class VoidlyAgent {
       }
     }
 
+    // If ML-KEM secret key is missing, auto-disable postQuantum to prevent sending
+    // PQ-encrypted messages that the recipient can't decrypt (asymmetric PQ = desync).
+    // The receiver-side fallback to X25519 still works for incoming PQ messages.
+    const effectiveConfig = (!mlkemSk && config?.postQuantum !== false)
+      ? { ...config, postQuantum: false }
+      : config;
+
     const agent = new VoidlyAgent({
       did: creds.did,
       apiKey: creds.apiKey,
@@ -623,7 +651,7 @@ export class VoidlyAgent {
       },
       mlkemPublicKey: mlkemPk,
       mlkemSecretKey: mlkemSk,
-    }, config);
+    }, effectiveConfig);
 
     // Restore ratchet states for forward secrecy session continuity
     if (creds.ratchetStates) {
@@ -663,9 +691,35 @@ export class VoidlyAgent {
           }
           if (rs.prevSendStep !== undefined) state.prevSendStep = rs.prevSendStep;
           state.dhSkippedKeys = new Map();
+          // Restore skipped message keys (out-of-order message recovery)
+          if (rs.skippedKeys && typeof rs.skippedKeys === 'object') {
+            for (const [step, keyB64] of Object.entries(rs.skippedKeys)) {
+              try {
+                const mk = decodeBase64(keyB64 as string);
+                if (mk.length === 32) state.skippedKeys.set(Number(step), mk);
+              } catch { /* ignore */ }
+            }
+          }
+          if (rs.dhSkippedKeys && typeof rs.dhSkippedKeys === 'object') {
+            for (const [label, keyB64] of Object.entries(rs.dhSkippedKeys)) {
+              try {
+                const mk = decodeBase64(keyB64 as string);
+                if (mk.length === 32) state.dhSkippedKeys.set(label, mk);
+              } catch { /* ignore */ }
+            }
+          }
           agent._ratchetStates.set(pairId, state);
         } catch {
           // Skip invalid ratchet state entries silently
+        }
+      }
+    }
+
+    // Restore per-peer decrypt fail counter (survives app restarts)
+    if (creds.peerDecryptFails && typeof creds.peerDecryptFails === 'object') {
+      for (const [peer, count] of Object.entries(creds.peerDecryptFails)) {
+        if (typeof count === 'number' && count > 0) {
+          agent._peerDecryptFails.set(peer, count);
         }
       }
     }
@@ -700,12 +754,14 @@ export class VoidlyAgent {
       sendChainKey: string; sendStep: number; recvChainKey: string; recvStep: number;
       rootKey?: string; dhSendSecretKey?: string; dhSendPublicKey?: string;
       dhRecvPubKey?: string; prevSendStep?: number;
+      skippedKeys?: Record<string, string>; dhSkippedKeys?: Record<string, string>;
     }>;
     mlkemPublicKey?: string;
     mlkemSecretKey?: string;
     signedPrekeySecret?: string;
     signedPrekeyPublic?: string;
     signedPrekeyId?: number;
+    peerDecryptFails?: Record<string, number>;
   } {
     // Export ratchet states for session persistence (includes Double Ratchet DH state)
     const ratchetStates: Record<string, any> = {};
@@ -724,6 +780,17 @@ export class VoidlyAgent {
       }
       if (state.dhRecvPubKey) rs.dhRecvPubKey = encodeBase64(state.dhRecvPubKey);
       if (state.prevSendStep !== undefined) rs.prevSendStep = state.prevSendStep;
+      // Export skipped message keys (out-of-order message recovery)
+      if (state.skippedKeys?.size) {
+        rs.skippedKeys = Object.fromEntries(
+          [...state.skippedKeys].map(([step, key]) => [String(step), encodeBase64(key)])
+        );
+      }
+      if (state.dhSkippedKeys?.size) {
+        rs.dhSkippedKeys = Object.fromEntries(
+          [...state.dhSkippedKeys].map(([label, key]) => [label, encodeBase64(key)])
+        );
+      }
       ratchetStates[pairId] = rs;
     }
 
@@ -741,6 +808,10 @@ export class VoidlyAgent {
         signedPrekeySecret: encodeBase64(this._signedPrekey.secretKey),
         signedPrekeyPublic: encodeBase64(this._signedPrekey.publicKey),
         signedPrekeyId: this._signedPrekeyId,
+      } : {}),
+      // Persist per-peer decrypt fail counter across restarts
+      ...(this._peerDecryptFails.size > 0 ? {
+        peerDecryptFails: Object.fromEntries(this._peerDecryptFails),
       } : {}),
     };
   }
@@ -790,13 +861,17 @@ export class VoidlyAgent {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json', 'X-Agent-Key': this.apiKey },
             body: JSON.stringify({ value: blob }),
-          }).catch(() => {}); // non-fatal
+          }).catch((e: unknown) => {
+            console.warn(`[voidly] ⚠ Relay ratchet persist failed: ${e instanceof Error ? e.message : e}`);
+          });
           break;
         case 'custom':
           if (this._onPersist) await this._onPersist(blob);
           break;
       }
-    } catch { /* persistence failure is non-fatal */ }
+    } catch (e) {
+      console.warn(`[voidly] ⚠ Ratchet state persistence failed (${this._persistMode}): ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /** Load persisted ratchet state and restore into memory */
@@ -830,13 +905,18 @@ export class VoidlyAgent {
               const data = await res.json() as any;
               blob = data.value;
             }
-          } catch { /* relay unavailable */ }
+          } catch (e) {
+            console.warn(`[voidly] ⚠ Relay ratchet load failed: ${e instanceof Error ? e.message : e}`);
+          }
           break;
         case 'custom':
           if (this._onLoad) blob = await this._onLoad();
           break;
       }
-    } catch { return; }
+    } catch (e) {
+      console.warn(`[voidly] ⚠ Ratchet state load failed (${this._persistMode}): ${e instanceof Error ? e.message : e}`);
+      return;
+    }
 
     if (!blob) return;
     try {
@@ -846,7 +926,30 @@ export class VoidlyAgent {
       if (!decrypted) return;
       const states = JSON.parse(encodeUTF8(decrypted));
       for (const [pairId, rs] of Object.entries(states) as [string, any][]) {
-        if (this._ratchetStates.has(pairId)) continue; // don't overwrite in-memory state
+        // Validate required fields exist and are correct type
+        if (!rs || typeof rs.sendStep !== 'number' || typeof rs.recvStep !== 'number'
+            || typeof rs.sendChainKey !== 'string' || typeof rs.recvChainKey !== 'string') {
+          continue; // skip malformed entry
+        }
+        // Bounds-check step counters
+        if (rs.sendStep < 0 || rs.recvStep < 0 || rs.sendStep > 0xFFFFFFFF || rs.recvStep > 0xFFFFFFFF) {
+          continue;
+        }
+
+        // If credentials already loaded a state for this peer, keep whichever is
+        // more advanced (higher total steps = more recent). This prevents the dual
+        // persistence conflict where the messenger's 8-second-stale credentials
+        // overwrite the SDK's near-realtime IndexedDB state.
+        if (this._ratchetStates.has(pairId)) {
+          const existing = this._ratchetStates.get(pairId)!;
+          const existingSteps = existing.sendStep + existing.recvStep;
+          const persistedSteps = (rs.sendStep || 0) + (rs.recvStep || 0);
+          if (persistedSteps <= existingSteps) {
+            continue; // Credentials state is newer or equal — keep it
+          }
+          // Persisted state is more advanced — fall through to overwrite
+        }
+
         const state: RatchetPeerState = {
           sendChainKey: decodeBase64(rs.sendChainKey),
           sendStep: rs.sendStep,
@@ -854,21 +957,23 @@ export class VoidlyAgent {
           recvStep: rs.recvStep,
           skippedKeys: new Map(),
         };
-        if (rs.rootKey) state.rootKey = decodeBase64(rs.rootKey);
-        if (rs.dhSendSecretKey && rs.dhSendPublicKey) {
+        if (rs.rootKey && typeof rs.rootKey === 'string') state.rootKey = decodeBase64(rs.rootKey);
+        if (typeof rs.dhSendSecretKey === 'string' && typeof rs.dhSendPublicKey === 'string') {
           state.dhSendKeyPair = {
             secretKey: decodeBase64(rs.dhSendSecretKey),
             publicKey: decodeBase64(rs.dhSendPublicKey),
           };
         }
-        if (rs.dhRecvPubKey) state.dhRecvPubKey = decodeBase64(rs.dhRecvPubKey);
-        if (rs.prevSendStep !== undefined) state.prevSendStep = rs.prevSendStep;
-        // Validate key sizes
+        if (typeof rs.dhRecvPubKey === 'string') state.dhRecvPubKey = decodeBase64(rs.dhRecvPubKey);
+        if (typeof rs.prevSendStep === 'number' && rs.prevSendStep >= 0) state.prevSendStep = rs.prevSendStep;
+        // Validate key sizes (all NaCl keys must be 32 bytes)
         if (state.sendChainKey.length === 32 && state.recvChainKey.length === 32) {
           this._ratchetStates.set(pairId, state);
         }
       }
-    } catch { /* corrupt data, start fresh */ }
+    } catch (e) {
+      console.warn(`[voidly] ⚠ Ratchet state restore failed (corrupt data, starting fresh): ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /** IndexedDB put helper (browser only) */
@@ -942,6 +1047,41 @@ export class VoidlyAgent {
   }
 
   /**
+   * Get per-peer consecutive decrypt failure counts.
+   * Useful for diagnosing which peer conversations have desynchronized ratchets.
+   */
+  get peerDecryptFails(): Record<string, number> {
+    return Object.fromEntries(this._peerDecryptFails);
+  }
+
+  /**
+   * Reset ratchet state for a specific peer.
+   * This clears all ratchet keys for the conversation, causing the next send
+   * to re-initialize a fresh DH exchange. The peer's ratchet will also reset
+   * automatically when they receive the new-format message.
+   *
+   * Use this when ratchet desync is detected (e.g., consecutive decrypt failures).
+   * After calling this, both sides need to send a message to re-establish the ratchet.
+   *
+   * @param peerDid - The DID of the peer whose ratchet should be reset
+   * @returns true if a ratchet was found and reset, false if no ratchet existed
+   */
+  resetRatchet(peerDid: string): boolean {
+    // Clear both directions: we→peer (send state) and peer→we (recv state)
+    const sendPairId = `${this.did}:${peerDid}`;
+    const recvPairId = `${peerDid}:${this.did}`;
+    const hadSend = this._ratchetStates.delete(sendPairId);
+    const hadRecv = this._ratchetStates.delete(recvPairId);
+    // Reset per-peer failure counter
+    this._peerDecryptFails.delete(peerDid);
+    // Persist the cleared state
+    if (hadSend || hadRecv) {
+      this._persistRatchetState().catch(() => {});
+    }
+    return hadSend || hadRecv;
+  }
+
+  /**
    * Generate a did:key identifier from this agent's Ed25519 signing key.
    * did:key is a W3C standard — interoperable across systems.
    * Format: did:key:z6Mk{base58-multicodec-ed25519-pubkey}
@@ -986,6 +1126,39 @@ export class VoidlyAgent {
       /** Force sealed sender for this message */
       sealedSender?: boolean;
       /** Disable padding for this message */
+      noPadding?: boolean;
+    } = {}
+  ): Promise<SendResult> {
+    // v3.4.2: Per-peer send mutex — two concurrent send() calls to the same peer
+    // would read the SAME sendChainKey, derive the SAME messageKey, encrypt
+    // different messages with identical keys → forward secrecy break + one
+    // message undecryptable by peer.
+    const lockKey = `send:${recipientDid}`;
+    while (this._sendLocks.has(lockKey)) {
+      await this._sendLocks.get(lockKey);
+    }
+    let unlockSend!: () => void;
+    this._sendLocks.set(lockKey, new Promise<void>(r => { unlockSend = r; }));
+    try {
+      return await this._sendInner(recipientDid, message, options);
+    } finally {
+      this._sendLocks.delete(lockKey);
+      unlockSend();
+    }
+  }
+
+  private async _sendInner(
+    recipientDid: string,
+    message: string,
+    options: {
+      contentType?: string;
+      threadId?: string;
+      replyTo?: string;
+      ttl?: number;
+      messageType?: string;
+      retries?: number;
+      skipPin?: boolean;
+      sealedSender?: boolean;
       noPadding?: boolean;
     } = {}
   ): Promise<SendResult> {
@@ -1185,8 +1358,10 @@ export class VoidlyAgent {
       payload.reply_to = options.replyTo;
     }
 
-    // Persist ratchet state after advancing chain
-    this._persistRatchetState().catch(() => {});
+    // Persist ratchet state after advancing chain — await to ensure durability
+    // before the message leaves. If persist fails, still proceed (message loss
+    // is worse than a potential ratchet step replay on crash).
+    try { await this._persistRatchetState(); } catch { /* best effort */ }
 
     // Try primary relay, then fallbacks
     const relays = [this.baseUrl, ...this.fallbackRelays];
@@ -1284,10 +1459,34 @@ export class VoidlyAgent {
       }>;
     };
 
-    return this._decryptMessages(data.messages);
+    const { decrypted, failedIds } = await this._decryptMessages(data.messages);
+
+    // Signal-style: mark undecryptable messages as read on the relay.
+    // They are permanently undecryptable (keys are wrong/gone) and will
+    // poison the queue if left unread — causing infinite retry loops.
+    if (failedIds.length > 0) {
+      try {
+        await this.markReadBatch(failedIds);
+      } catch {
+        // Batch failed — try individual markReads as fallback
+        for (const id of failedIds) {
+          try { await this.markRead(id); } catch { /* ignore */ }
+        }
+      }
+    }
+
+    return decrypted;
   }
 
-  /** Decrypt raw message objects (shared by receive(), SSE, WebSocket transports) */
+  /** Decrypt raw message objects (shared by receive(), SSE, WebSocket transports)
+   * Returns decrypted messages AND IDs of messages that failed to decrypt.
+   * Failed messages should be marked as read on the relay — they are permanently
+   * undecryptable and will poison the queue if left unread (Signal-style handling).
+   *
+   * v3.4.2: Global mutex — SSE and poll can both call _decryptMessages concurrently.
+   * Both would read the same peer's ratchet state, advance it independently, and
+   * the second one would overwrite the first's changes → ratchet desync.
+   */
   private async _decryptMessages(rawMessages: Array<{
     id: string; from: string; to: string;
     ciphertext: string; nonce: string; signature: string;
@@ -1295,13 +1494,44 @@ export class VoidlyAgent {
     envelope: string | null; content_type: string; message_type: string;
     thread_id: string | null; reply_to: string | null;
     timestamp: string; expires_at: string;
-  }>): Promise<DecryptedMessage[]> {
+  }>): Promise<{ decrypted: DecryptedMessage[]; failedIds: string[] }> {
+    // v3.4.2: Global decrypt mutex — only one decrypt batch runs at a time
+    while (this._decryptLock) await this._decryptLock;
+    let unlockDecrypt!: () => void;
+    this._decryptLock = new Promise<void>(r => { unlockDecrypt = r; });
+    try {
+      return await this._decryptMessagesInner(rawMessages);
+    } finally {
+      this._decryptLock = null;
+      unlockDecrypt();
+    }
+  }
+
+  private async _decryptMessagesInner(rawMessages: Array<{
+    id: string; from: string; to: string;
+    ciphertext: string; nonce: string; signature: string;
+    sender_encryption_key: string; sender_signing_key: string;
+    envelope: string | null; content_type: string; message_type: string;
+    thread_id: string | null; reply_to: string | null;
+    timestamp: string; expires_at: string;
+  }>): Promise<{ decrypted: DecryptedMessage[]; failedIds: string[] }> {
     const decrypted: DecryptedMessage[] = [];
+    const failedIds: string[] = [];
+
+    // Track peers that had ratchet auto-reset during this batch.
+    // After reset, the !state path handles subsequent messages via fresh X3DH,
+    // so we don't blanket-skip — each message is tried independently.
+    const resetPeers = new Set<string>();
 
     for (const msg of rawMessages) {
       try {
         // Deduplicate — skip already-seen messages
-        if (this._seenMessageIds.has(msg.id)) continue;
+        if (this._seenMessageIds.has(msg.id)) {
+          // Already processed — add to failedIds so relay marks it read
+          // (prevents infinite re-delivery if markRead failed on first delivery)
+          failedIds.push(msg.id);
+          continue;
+        }
 
         // v3: sender keys may be null for sealed messages (from_did = 'sealed')
         // Extract sender DID from envelope to look up keys
@@ -1314,10 +1544,14 @@ export class VoidlyAgent {
           // Sealed message — get sender DID from envelope, look up keys from cache/relay
           const env = JSON.parse(msg.envelope);
           const senderProfile = await this.getIdentity(env.from);
-          if (!senderProfile) continue; // Can't decrypt without sender's key
+          if (!senderProfile) {
+            failedIds.push(msg.id);  // Mark as read so relay doesn't re-deliver forever
+            continue; // Can't decrypt without sender's key
+          }
           senderEncPub = decodeBase64(senderProfile.encryption_public_key);
           if (senderProfile.signing_public_key) senderSignPubBytes = decodeBase64(senderProfile.signing_public_key);
         } else {
+          failedIds.push(msg.id);  // Mark as read so relay doesn't re-deliver forever
           continue; // Can't decrypt without sender's key
         }
         const ciphertext = decodeBase64(msg.ciphertext);
@@ -1334,16 +1568,20 @@ export class VoidlyAgent {
         if (msg.envelope) {
           try {
             const env = JSON.parse(msg.envelope);
-            if (typeof env.ratchet_step === 'number') {
+            // Bounds-check ratchet_step: must be non-negative integer within sane range
+            if (typeof env.ratchet_step === 'number' && Number.isInteger(env.ratchet_step)
+                && env.ratchet_step >= 0 && env.ratchet_step <= 0xFFFFFFFF) {
               envelopeRatchetStep = env.ratchet_step;
             }
-            if (typeof env.pq_ciphertext === 'string') {
+            if (typeof env.pq_ciphertext === 'string' && env.pq_ciphertext.length <= 65536) {
               envelopePqCiphertext = env.pq_ciphertext;
             }
-            if (typeof env.dh_ratchet_key === 'string') {
+            if (typeof env.dh_ratchet_key === 'string' && env.dh_ratchet_key.length <= 256) {
               envelopeDhRatchetKey = env.dh_ratchet_key;
             }
-            if (typeof env.pn === 'number') {
+            // Bounds-check pn: must be non-negative integer within sane range
+            if (typeof env.pn === 'number' && Number.isInteger(env.pn)
+                && env.pn >= 0 && env.pn <= 0xFFFFFFFF) {
               envelopePn = env.pn;
             }
           } catch { /* ignore parse errors */ }
@@ -1403,6 +1641,11 @@ export class VoidlyAgent {
               };
             }
             this._ratchetStates.set(pairId, state);
+            // Also clear our SENDING state to this peer — they started fresh,
+            // so our advanced sending chain would produce undecryptable messages.
+            // Next send() will create fresh X3DH in the A:B direction too.
+            const sendPairId = `${this.did}:${msg.from}`;
+            this._ratchetStates.delete(sendPairId);
           } else if (envelopeDhRatchetKey && state.rootKey) {
             // Double Ratchet: DH ratchet step — new DH key from sender
             const senderDhPub = decodeBase64(envelopeDhRatchetKey);
@@ -1418,9 +1661,11 @@ export class VoidlyAgent {
                   if (!state.dhSkippedKeys) state.dhSkippedKeys = new Map();
                   state.dhSkippedKeys.set(skipKey, skippedMk);
                   ck = nextChainKey;
-                  if (state.dhSkippedKeys.size > MAX_SKIP) {
+                  // Batch evict excess skipped keys (not just one)
+                  while (state.dhSkippedKeys.size > MAX_SKIP) {
                     const oldest = state.dhSkippedKeys.keys().next().value;
                     if (oldest !== undefined) state.dhSkippedKeys.delete(oldest);
+                    else break;
                   }
                 }
               }
@@ -1465,8 +1710,19 @@ export class VoidlyAgent {
             // Ratchet forward, caching skipped keys
             const skip = targetStep - state.recvStep;
             if (skip > MAX_SKIP) {
-              // Too many skipped — possible attack, fall back to legacy
-              rawPlaintext = nacl.box.open(ciphertext, nonce, senderEncPub, this.encryptionKeyPair.secretKey);
+              // Too many skipped — possible DoS or desync. Reject ratcheted message
+              // (falling back to legacy box would always fail for secretbox-encrypted data)
+              this._decryptFailCount++;
+              failedIds.push(msg.id);
+              const peerForSkip = msg.from || 'unknown';
+              const prevSkipFails = this._peerDecryptFails.get(peerForSkip) || 0;
+              this._peerDecryptFails.set(peerForSkip, prevSkipFails + 1);
+              if (this._autoResetThreshold > 0 && prevSkipFails + 1 >= this._autoResetThreshold) {
+                this.resetRatchet(peerForSkip);
+                resetPeers.add(peerForSkip);
+                this._onRatchetReset?.(peerForSkip, prevSkipFails + 1);
+              }
+              continue;
             } else {
               let ck = state.recvChainKey;
               for (let i = state.recvStep + 1; i < targetStep; i++) {
@@ -1474,9 +1730,11 @@ export class VoidlyAgent {
                 state.skippedKeys.set(i, skippedMk);
                 ck = nextChainKey;
                 // Evict oldest if cache too large
-                if (state.skippedKeys.size > MAX_SKIP) {
+                // Batch evict excess skipped keys (not just one)
+                while (state.skippedKeys.size > MAX_SKIP) {
                   const oldest = state.skippedKeys.keys().next().value;
                   if (oldest !== undefined) state.skippedKeys.delete(oldest);
+                  else break;
                 }
               }
               // Derive the target step's key
@@ -1486,7 +1744,79 @@ export class VoidlyAgent {
               rawPlaintext = nacl.secretbox.open(ciphertext, nonce, messageKey);
             }
           }
-          // If ratchet decryption failed, fall back to legacy
+          // If ratchet decryption failed, try re-initializing fresh (stale ratchet recovery)
+          // This handles the case where our ratchet state is stale (e.g. peer restarted
+          // and lost their state) — we re-derive from scratch using X3DH
+          if (!rawPlaintext && envelopeDhRatchetKey && this.doubleRatchet && state) {
+            try {
+              const x25519Shared2 = nacl.box.before(senderEncPub, this.encryptionKeyPair.secretKey);
+              let initialKey2: Uint8Array;
+              if (envelopePqCiphertext && this.mlkemSecretKey) {
+                try {
+                  const pqCt2 = decodeBase64(envelopePqCiphertext);
+                  const kem2 = new MlKem768();
+                  const pqShared2 = await kem2.decap(pqCt2, this.mlkemSecretKey);
+                  const combined2 = new Uint8Array(x25519Shared2.length + pqShared2.length);
+                  combined2.set(x25519Shared2, 0);
+                  combined2.set(pqShared2, x25519Shared2.length);
+                  initialKey2 = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', combined2));
+                } catch {
+                  initialKey2 = x25519Shared2;
+                }
+              } else {
+                initialKey2 = x25519Shared2;
+              }
+              const senderDhPub2 = decodeBase64(envelopeDhRatchetKey);
+              const dhOutput2 = nacl.box.before(senderDhPub2, this.encryptionKeyPair.secretKey);
+              const { newRootKey: rk2, newChainKey: ck2 } = await kdfRK(initialKey2, dhOutput2);
+              // Try decrypting with fresh-init chain key
+              let freshCk = ck2;
+              for (let fi = 1; fi < envelopeRatchetStep; fi++) {
+                const { nextChainKey: nck } = await ratchetStep(freshCk);
+                freshCk = nck;
+              }
+              const { nextChainKey: finalCk, messageKey: freshMk } = await ratchetStep(freshCk);
+              const freshPlain = nacl.secretbox.open(ciphertext, nonce, freshMk);
+              if (freshPlain) {
+                // Fresh init succeeded — replace stale state with new one
+                rawPlaintext = freshPlain;
+                state.recvChainKey = finalCk;
+                state.recvStep = envelopeRatchetStep;
+                state.rootKey = rk2;
+                state.dhRecvPubKey = senderDhPub2;
+                state.prevSendStep = state.sendStep;
+                state.dhSendKeyPair = nacl.box.keyPair();
+                state.sendStep = 0;
+                // Note: sendChainKey is derived from DH ratchet step below (not initialKey2)
+                const dhOut3 = nacl.box.before(senderDhPub2, state.dhSendKeyPair.secretKey);
+                const kdf3 = await kdfRK(state.rootKey, dhOut3);
+                state.rootKey = kdf3.newRootKey;
+                state.sendChainKey = kdf3.newChainKey;
+                if (state.dhSkippedKeys) state.dhSkippedKeys.clear();
+                if (state.skippedKeys) state.skippedKeys.clear();
+                // Mirror Fix 4: clear our SENDING state to this peer.
+                // They re-initialized from scratch, so our old send chain
+                // would produce undecryptable messages.
+                const sendPairId2 = `${this.did}:${msg.from}`;
+                this._ratchetStates.delete(sendPairId2);
+              }
+            } catch {
+              // Fresh-init fallback failed too — continue to legacy fallback
+            }
+          }
+          // If ratcheted decryption AND stale recovery both failed, immediately reset
+          // the ratchet for this peer. Max 1 message lost, but the NEXT message
+          // triggers fresh X3DH and conversation auto-recovers. Without this, the
+          // broken ratchet persists forever (autoResetThreshold never reached across
+          // app restarts since the counter is in-memory).
+          if (!rawPlaintext && state) {
+            this.resetRatchet(msg.from);
+            resetPeers.add(msg.from);
+            this._onRatchetReset?.(msg.from, 1);
+            failedIds.push(msg.id);
+            continue; // Skip legacy fallback — can't help with ratcheted messages
+          }
+          // If still failed, fall back to legacy nacl.box
           if (!rawPlaintext) {
             rawPlaintext = nacl.box.open(ciphertext, nonce, senderEncPub, this.encryptionKeyPair.secretKey);
           }
@@ -1497,7 +1827,26 @@ export class VoidlyAgent {
 
         if (!rawPlaintext) {
           this._decryptFailCount++;
+          failedIds.push(msg.id);
+          // Track per-peer failures for auto-recovery
+          const senderForFail = msg.from || 'unknown';
+          const prevFails = this._peerDecryptFails.get(senderForFail) || 0;
+          this._peerDecryptFails.set(senderForFail, prevFails + 1);
+          // Auto-reset ratchet after consecutive failures from same peer
+          if (this._autoResetThreshold > 0 && prevFails + 1 >= this._autoResetThreshold) {
+            this.resetRatchet(senderForFail);
+            resetPeers.add(senderForFail);
+            this._onRatchetReset?.(senderForFail, prevFails + 1);
+          }
           continue;
+        }
+
+        // Successful decryption — reset per-peer failure counter
+        {
+          const senderForSuccess = msg.from || 'unknown';
+          if (this._peerDecryptFails.has(senderForSuccess)) {
+            this._peerDecryptFails.delete(senderForSuccess);
+          }
         }
 
         // ── Parse protocol header if present ──
@@ -1579,14 +1928,22 @@ export class VoidlyAgent {
         // Enforce signature verification if configured
         if (this.requireSignatures && !signatureValid) {
           this._decryptFailCount++;
+          failedIds.push(msg.id);
+          const peerForSig = msg.from || 'unknown';
+          const prevSigFails = this._peerDecryptFails.get(peerForSig) || 0;
+          this._peerDecryptFails.set(peerForSig, prevSigFails + 1);
           continue;
         }
 
         // Track seen message ID (cap at 10000 to prevent memory leak)
         this._seenMessageIds.add(msg.id);
         if (this._seenMessageIds.size > 10000) {
-          const first = this._seenMessageIds.values().next().value;
-          if (first !== undefined) this._seenMessageIds.delete(first);
+          // Batch evict oldest 1000 entries
+          const iter = this._seenMessageIds.values();
+          for (let i = 0; i < 1000; i++) {
+            const v = iter.next().value;
+            if (v !== undefined) this._seenMessageIds.delete(v);
+          }
         }
 
         decrypted.push({
@@ -1605,16 +1962,26 @@ export class VoidlyAgent {
         });
       } catch {
         this._decryptFailCount++;
-        // Skip messages that fail to decrypt — count is tracked via decryptFailCount getter
+        failedIds.push(msg.id);
+        // Track per-peer for auto-recovery
+        const peerForCatch = msg.from || 'unknown';
+        const prevCatchFails = this._peerDecryptFails.get(peerForCatch) || 0;
+        this._peerDecryptFails.set(peerForCatch, prevCatchFails + 1);
+        if (this._autoResetThreshold > 0 && prevCatchFails + 1 >= this._autoResetThreshold) {
+          this.resetRatchet(peerForCatch);
+          resetPeers.add(peerForCatch);
+          this._onRatchetReset?.(peerForCatch, prevCatchFails + 1);
+        }
       }
     }
 
     // Persist ratchet state after processing received messages
-    if (decrypted.length > 0) {
+    // Also persist after decrypt failures (ratchet may have been reset)
+    if (decrypted.length > 0 || this._peerDecryptFails.size > 0) {
       this._persistRatchetState().catch(() => {});
     }
 
-    return decrypted;
+    return { decrypted, failedIds };
   }
 
   // ─── Message Management ─────────────────────────────────────────────────────
@@ -1685,10 +2052,14 @@ export class VoidlyAgent {
 
     // Cache the result
     this._identityCache.set(did, { profile, cachedAt: Date.now() });
-    // Evict old entries if cache too large
+    // Batch evict old entries if cache too large (trim back to 400)
     if (this._identityCache.size > 500) {
-      const oldest = this._identityCache.keys().next().value;
-      if (oldest !== undefined) this._identityCache.delete(oldest);
+      const excess = this._identityCache.size - 400;
+      const iter = this._identityCache.keys();
+      for (let i = 0; i < excess; i++) {
+        const key = iter.next().value;
+        if (key !== undefined) this._identityCache.delete(key);
+      }
     }
 
     return profile;
@@ -1832,8 +2203,12 @@ export class VoidlyAgent {
     };
 
     // Rotate ML-KEM key if post-quantum is enabled
+    let newMlkemSk: Uint8Array | null = null;
     if (this.postQuantum && this.mlkemPublicKey) {
-      body.mlkem_public_key = this.mlkemPublicKey; // re-register existing (ML-KEM rotation requires external lib)
+      const kem = new MlKem768();
+      const [newPk, newSk] = await kem.generateKeyPair();
+      body.mlkem_public_key = encodeBase64(newPk);
+      newMlkemSk = newSk;
     }
 
     const res = await this._timedFetch(`${this.baseUrl}/v1/agent/rotate-keys`, {
@@ -1854,6 +2229,16 @@ export class VoidlyAgent {
     this.encryptionKeyPair = newEncryptionKeyPair;
     this._signedPrekey = newSignedPrekey;
     this._signedPrekeyId = newSignedPrekeyId;
+    if (newMlkemSk) {
+      this.mlkemSecretKey = newMlkemSk;
+      this.mlkemPublicKey = decodeBase64(body.mlkem_public_key as string);
+    }
+
+    // Invalidate identity cache — peers must fetch fresh keys after rotation
+    this._identityCache.clear();
+
+    // Clear TOFU pins since our own keys changed and peers' cached pins are stale
+    this._pinnedDids.clear();
 
     // Upload fresh batch of one-time prekeys
     await this.uploadPrekeys(10);
@@ -3202,11 +3587,16 @@ export class VoidlyAgent {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
+    // v3.4.6: Expose SSE abort so stop() can immediately kill in-flight connections
+    let sseAbortController: AbortController | null = null;
+
     const handle: ListenHandle = {
       stop: () => {
         active = false;
         if (timer) clearTimeout(timer);
         if (heartbeatTimer) clearInterval(heartbeatTimer);
+        // v3.4.6: Immediately abort SSE connection — don't wait for next reader.read()
+        if (sseAbortController) { sseAbortController.abort(); sseAbortController = null; }
         this._listeners.delete(handle as any);
       },
       get active() { return active; },
@@ -3256,6 +3646,7 @@ export class VoidlyAgent {
 
         // SSE needs a long-lived connection — use raw fetch with 60s timeout
         const controller = new AbortController();
+        sseAbortController = controller; // v3.4.6: expose to handle.stop()
         const sseTimeout = setTimeout(() => controller.abort(), 60000);
         let res: Response;
         try {
@@ -3275,6 +3666,15 @@ export class VoidlyAgent {
         let buffer = '';
 
         try {
+          // v3.4.5 FIX: Event state MUST persist across chunks!
+          // SSE messages with large ciphertext span multiple TCP chunks.
+          // Previously these vars were inside the while loop, so eventType
+          // set in chunk 1 was lost when chunk 2 arrived → ALL SSE messages
+          // silently dropped → messages only delivered via slow fallback poll.
+          let eventType = '';
+          let dataStr = '';
+          let eventId = '';
+
           while (active && !options.signal?.aborted) {
             const { done: streamDone, value } = await reader.read();
             if (streamDone) break;
@@ -3283,9 +3683,6 @@ export class VoidlyAgent {
             const lines = buffer.split('\n');
             buffer = lines.pop() || ''; // Keep incomplete line
 
-            let eventType = '';
-            let dataStr = '';
-            let eventId = '';
             for (const line of lines) {
               if (line.startsWith('event: ')) {
                 eventType = line.slice(7).trim();
@@ -3299,7 +3696,11 @@ export class VoidlyAgent {
                 if (eventType === 'message' && dataStr) {
                   try {
                     const rawMsg = JSON.parse(dataStr);
-                    const decrypted = await this._decryptMessages([rawMsg]);
+                    const { decrypted, failedIds } = await this._decryptMessages([rawMsg]);
+                    // Mark undecryptable messages as read so they don't loop forever
+                    for (const id of failedIds) {
+                      try { await this.markRead(id); } catch { /* ignore */ }
+                    }
                     if (decrypted.length > 0) {
                       consecutiveEmpty = 0;
                       sseFailures = 0; // Reset failure counter on success

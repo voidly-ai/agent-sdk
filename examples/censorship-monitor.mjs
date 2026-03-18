@@ -1,73 +1,69 @@
+#!/usr/bin/env node
 /**
- * Voidly Agent SDK — Censorship Monitor
+ * Censorship Monitor — Real-world use case combining Voidly data + agent messaging.
  *
- * Combines Voidly's censorship data API with agent messaging
- * to build a monitoring pipeline that alerts on new incidents.
+ * Run:  node examples/censorship-monitor.mjs
  *
- * Run: npm run monitor (or: node examples/censorship-monitor.mjs)
+ * Fetches live censorship data from the Voidly API, checks for high block
+ * rates, and sends an encrypted alert to a subscriber agent.
  */
 import { VoidlyAgent } from '@voidly/agent-sdk';
 
-try {
-const monitor = await VoidlyAgent.register({ name: 'censorship-monitor' });
-const alertReceiver = await VoidlyAgent.register({ name: 'alert-receiver' });
+const ALERT_THRESHOLD = 50; // Alert if censorship score > 50 (out of 100)
 
-// Register a capability so other agents can find this monitor
-await monitor.registerCapability({
-  name: 'censorship-monitoring',
-  description: 'Monitors Voidly censorship API and alerts on new incidents',
-  version: '1.0.0',
-});
+// Register a monitor agent and a subscriber agent
+const monitor    = await VoidlyAgent.register({ name: 'censorship-monitor' });
+const subscriber = await VoidlyAgent.register({ name: 'alert-subscriber' });
 
-// Check for high-risk countries
-const response = await fetch('https://api.voidly.ai/v1/forecast/high-risk?threshold=0.5');
-const highRisk = await response.json();
+console.log(`Monitor:    ${monitor.did}`);
+console.log(`Subscriber: ${subscriber.did}\n`);
 
-if (highRisk.countries && highRisk.countries.length > 0) {
-  const alert = highRisk.countries
-    .map(c => `${c.country} (${(c.max_risk * 100).toFixed(0)}% risk)`)
-    .join(', ');
+// Fetch live censorship index from Voidly public API
+console.log('Fetching live censorship data...');
+const res = await fetch('https://api.voidly.ai/data/censorship-index.json');
+const index = await res.json();
+const countries = index.countries;
+console.log(`Loaded data for ${countries.length} countries.\n`);
 
-  // Send encrypted alert to the receiver agent
-  await monitor.send(alertReceiver.did, `⚠️ High-risk countries: ${alert}`);
-  console.log('Alert sent:', alert);
-}
+// Find countries above the alert threshold
+const alerts = countries
+  .filter((c) => c.score > ALERT_THRESHOLD)
+  .sort((a, b) => b.score - a.score)
+  .slice(0, 5);
 
-// Check recent incidents
-const incidentsRes = await fetch('https://api.voidly.ai/data/incidents?limit=5');
-const incidents = await incidentsRes.json();
+if (alerts.length === 0) {
+  console.log('No countries above alert threshold.');
+} else {
+  console.log(`${alerts.length} countries with censorship score > ${ALERT_THRESHOLD}:\n`);
 
-if (incidents.incidents) {
-  for (const inc of incidents.incidents.slice(0, 3)) {
-    await monitor.send(
-      alertReceiver.did,
-      `Incident ${inc.readable_id || inc.id}: ${inc.title} (${inc.country_name}, severity: ${inc.severity})`
-    );
+  for (const country of alerts) {
+    const alertMsg = JSON.stringify({
+      type: 'censorship_alert',
+      country: country.country,
+      code: country.code,
+      score: country.score,
+      level: country.level,
+      samples: country.samples,
+    });
+
+    // Send encrypted alert
+    await monitor.send(subscriber.did, alertMsg, {
+      contentType: 'application/json',
+      messageType: 'alert',
+    });
+
+    console.log(`  ⚠ ${country.country} (${country.code}): score ${country.score}/100 [${country.level}]`);
   }
-  console.log(`Sent ${Math.min(3, incidents.incidents.length)} incident alerts`);
+
+  // Subscriber receives encrypted alerts
+  console.log('\nSubscriber receiving alerts...');
+  const messages = await subscriber.receive({ limit: 10 });
+  console.log(`Received ${messages.length} encrypted alerts.`);
+
+  for (const msg of messages) {
+    const data = JSON.parse(msg.content);
+    console.log(`  ✓ ${data.country}: score ${data.score}/100 — signature valid: ${msg.signatureValid}`);
+  }
 }
 
-// Receiver reads all alerts
-const messages = await alertReceiver.receive();
-console.log(`\nReceived ${messages.length} alerts:`);
-for (const msg of messages) {
-  console.log(`  ${msg.content}`);
-}
-
-// Store analysis results in encrypted memory
-await monitor.memorySet('monitoring', 'last-check', {
-  timestamp: new Date().toISOString(),
-  highRiskCount: highRisk.countries?.length || 0,
-  incidentCount: incidents.incidents?.length || 0,
-});
-
-const stored = await monitor.memoryGet('monitoring', 'last-check');
-console.log('\nStored in encrypted memory:', stored.value);
-
-// Clean up
-await monitor.deactivate();
-await alertReceiver.deactivate();
-} catch (err) {
-  console.error('Error:', err.message);
-  process.exit(1);
-}
+console.log('\n✓ Done — censorship monitoring with E2E encrypted alerts.');

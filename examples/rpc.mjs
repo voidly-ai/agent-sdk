@@ -1,57 +1,42 @@
+#!/usr/bin/env node
 /**
- * Voidly Agent SDK — Remote Procedure Calls
+ * Agent RPC — Call functions on remote agents.
  *
- * One agent exposes functions that another agent can call remotely.
- * All RPC traffic is E2E encrypted.
+ * Run:  node examples/rpc.mjs
  *
- * Run: npm run rpc (or: node examples/rpc.mjs)
+ * Agent A exposes a "translate" method. Agent B invokes it remotely.
+ * The RPC payload is E2E encrypted — the relay never sees the request or response.
  */
 import { VoidlyAgent } from '@voidly/agent-sdk';
 
-try {
-// Register a "service" agent that exposes functions
-const service = await VoidlyAgent.register({ name: 'translate-service' });
-
-// Register RPC handlers
-service.onInvoke('translate', async (params, callerDid) => {
-  console.log(`Translation request from ${callerDid}`);
-  // In a real app, call a translation API here
-  return {
-    original: params.text,
-    translated: `[translated to ${params.target}]: ${params.text}`,
-    language: params.target,
-  };
+// Register a "translator" agent and a "client" agent
+const translator = await VoidlyAgent.register({
+  name: 'rpc-translator',
+  capabilities: ['translate'],
 });
-
-service.onInvoke('summarize', async (params) => {
-  return {
-    summary: `Summary of ${params.text.length} chars: ${params.text.substring(0, 50)}...`,
-    wordCount: params.text.split(' ').length,
-  };
-});
-
-// Register a "client" agent that calls the service
 const client = await VoidlyAgent.register({ name: 'rpc-client' });
 
-// Call the remote translate function (encrypted round-trip)
-const result = await client.invoke(service.did, 'translate', {
-  text: 'Internet censorship is increasing globally',
-  target: 'es',
+console.log(`Translator: ${translator.did}`);
+console.log(`Client:     ${client.did}\n`);
+
+// Translator registers an RPC handler
+translator.onInvoke('translate', async (params) => {
+  console.log(`Translator received RPC: translate("${params.text}" → ${params.to})`);
+  // Simulate translation (real agent would call an LLM or translation API)
+  const translations = { es: 'Hola', fr: 'Bonjour', de: 'Hallo', ja: 'こんにちは' };
+  return { translated: translations[params.to] || params.text, lang: params.to };
 });
 
-console.log('RPC Result:', result);
+// Start the translator's listener so it can receive RPC calls
+const stop = translator.listen(() => {});
 
-// Call summarize
-const summary = await client.invoke(service.did, 'summarize', {
-  text: 'The Voidly Censorship Intelligence Platform monitors internet freedom across 126 countries using 39+ probe nodes and ML classification.',
+// Client invokes the translator's "translate" method
+console.log('Client calling translate("Hello" → "es")...');
+const result = await client.invoke(translator.did, 'translate', {
+  text: 'Hello',
+  to: 'es',
 });
+console.log(`Result: ${JSON.stringify(result)}`);
 
-console.log('Summary:', summary);
-
-// Clean up
-await service.deactivate();
-await client.deactivate();
-} catch (err) {
-  console.error('Error:', err.message);
-  process.exit(1);
-}
+stop(); // Stop listening
+console.log('\n✓ Done — remote procedure call over E2E encrypted channel.');

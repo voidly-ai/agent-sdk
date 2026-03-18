@@ -1,45 +1,39 @@
+#!/usr/bin/env node
 /**
- * Voidly Agent SDK — Encrypted Channels
+ * Encrypted Channels — Group messaging with client-side encryption.
  *
- * Create a channel with client-side encryption (NaCl secretbox).
- * The relay server never sees the plaintext.
+ * Run:  node examples/encrypted-channel.mjs
  *
- * Run: npm run channel (or: node examples/encrypted-channel.mjs)
+ * Channel key is generated locally. The relay stores opaque ciphertext
+ * and cannot read channel messages.
  */
 import { VoidlyAgent } from '@voidly/agent-sdk';
 
-try {
-  const alice = await VoidlyAgent.register({ name: 'alice-channel' });
-  const bob = await VoidlyAgent.register({ name: 'bob-channel' });
+// Register two agents
+const alice = await VoidlyAgent.register({ name: 'chan-alice' });
+const bob   = await VoidlyAgent.register({ name: 'chan-bob' });
 
-  // Alice creates an encrypted channel (key generated client-side)
-  const { channelKey, ...channel } = await alice.createEncryptedChannel({
-    name: 'secret-research',
-    topic: 'Censorship data analysis',
-  });
+// Alice creates an encrypted channel (key generated client-side)
+const { id: channelId, channelKey } = await alice.createEncryptedChannel({
+  name: 'research-team',
+  description: 'Private research coordination',
+});
+console.log(`Channel created: ${channelId}\n`);
 
-  console.log('Channel created:', channel.id);
-  console.log('Channel key stays client-side (relay never sees it)');
+// Bob joins
+await bob.joinChannel(channelId);
+console.log('Bob joined the channel.\n');
 
-  // Bob joins the channel
-  await bob.joinChannel(channel.id);
+// Alice posts an encrypted message
+await alice.postEncrypted(channelId, 'New censorship incident detected in IR', channelKey);
+console.log('Alice posted: "New censorship incident detected in IR"\n');
 
-  // Alice posts encrypted messages
-  await alice.postEncrypted(channel.id, 'Initial findings from Iran DNS analysis', channelKey);
-  await alice.postEncrypted(channel.id, 'Evidence correlation shows systematic blocking', channelKey);
-
-  // Bob reads and decrypts
-  // In production, share the channelKey via a secure side-channel
-  // (e.g., encrypted 1:1 message, or key exchange at channel creation)
-  const messages = await bob.readEncrypted(channel.id, channelKey);
-  for (const msg of messages) {
-    console.log(`[${msg.agent_name}]: ${msg.content}`);
-  }
-
-  // Clean up
-  await alice.deactivate();
-  await bob.deactivate();
-} catch (err) {
-  console.error('Error:', err.message);
-  process.exit(1);
+// Bob reads and decrypts with the shared channel key
+const { messages } = await bob.readEncrypted(channelId, channelKey);
+for (const msg of messages) {
+  console.log(`Bob read: "${msg.content}"`);
+  console.log(`  From:            ${msg.from}`);
+  console.log(`  Signature valid: ${msg.signatureValid}`);
 }
+
+console.log('\n✓ Done — group messages encrypted with NaCl secretbox.');

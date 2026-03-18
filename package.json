@@ -1,6 +1,6 @@
 {
   "name": "@voidly/agent-sdk",
-  "version": "3.2.4",
+  "version": "3.4.9",
   "description": "E2E encrypted agent-to-agent communication SDK — Double Ratchet, X3DH, deniable auth, ML-KEM-768 post-quantum, SSE streaming, ratchet persistence, multi-relay federation",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -13,7 +13,10 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",
@@ -31,13 +34,20 @@
   },
   "keywords": [
     "agent",
+    "ai-agent",
+    "multi-agent",
     "encryption",
     "e2e",
+    "double-ratchet",
+    "post-quantum",
     "nacl",
     "did",
+    "privacy",
     "voidly",
     "mcp",
-    "a2a"
+    "a2a",
+    "langchain",
+    "crewai"
   ],
   "license": "MIT",
   "repository": {

@@ -1,55 +1,45 @@
+#!/usr/bin/env node
 /**
- * Voidly Agent SDK — Conversations
+ * Conversations — Threaded dialog between agents.
  *
- * Threaded dialog between two agents with waitForReply.
- * Each conversation tracks its own thread.
+ * Run:  node examples/conversation.mjs
  *
- * Run: npm run conversation (or: node examples/conversation.mjs)
+ * Uses conversation() to auto-thread messages and waitForReply()
+ * for synchronous back-and-forth. Great for LLM agent dialogs.
  */
 import { VoidlyAgent } from '@voidly/agent-sdk';
 
-try {
-const analyst = await VoidlyAgent.register({ name: 'analyst' });
-const reviewer = await VoidlyAgent.register({ name: 'reviewer' });
+const researcher = await VoidlyAgent.register({ name: 'conv-researcher' });
+const analyst    = await VoidlyAgent.register({ name: 'conv-analyst' });
 
-// Start a conversation
-const conv = analyst.conversation(reviewer.did);
+console.log(`Researcher: ${researcher.did}`);
+console.log(`Analyst:    ${analyst.did}\n`);
 
-// Analyst sends initial message
-await conv.say('I found evidence of DNS poisoning targeting twitter.com in IR.');
+// Start a threaded conversation
+const conv = researcher.conversation(analyst.did);
 
-// Reviewer listens and responds
-reviewer.listen(async (msg) => {
-  if (msg.content.includes('DNS poisoning')) {
-    const reviewConv = reviewer.conversation(analyst.did);
-    await reviewConv.say('Can you share the OONI measurement IDs?');
-  } else if (msg.content.includes('OONI-')) {
-    const reviewConv = reviewer.conversation(analyst.did);
-    await reviewConv.say('Confirmed. Cross-referencing with CensoredPlanet Satellite data.');
-  }
-});
+// Researcher sends first message
+await conv.say('Is twitter.com currently blocked in Iran?');
+console.log('Researcher: "Is twitter.com currently blocked in Iran?"');
 
-// Analyst waits for the reviewer's reply
+// Simulate the analyst responding (in a real app, the analyst's
+// listener would process the question and reply automatically)
+const analystConv = analyst.conversation(researcher.did, conv.threadId);
+await analystConv.say('Yes — DNS poisoning detected across 3 major ISPs. Block rate: 94%.');
+console.log('Analyst:    "Yes — DNS poisoning detected across 3 major ISPs."');
+
+// Researcher waits for the reply
 const reply = await conv.waitForReply(10000);
-console.log('Reviewer:', reply.content);
+console.log(`\nResearcher received reply: "${reply.content}"`);
+console.log(`  Thread:          ${reply.threadId}`);
+console.log(`  Signature valid: ${reply.signatureValid}`);
 
-// Continue the thread
-await conv.say('OONI-IR-2026-DNS-001, OONI-IR-2026-DNS-002, OONI-IR-2026-DNS-003');
-
-const reply2 = await conv.waitForReply(10000);
-console.log('Reviewer:', reply2.content);
-
-// Get full conversation history
+// View full conversation history
 const history = await conv.history();
-console.log(`\nConversation (${history.length} messages):`);
+console.log(`\nConversation history: ${history.length} messages`);
 for (const msg of history) {
-  console.log(`  [${msg.role}]: ${msg.content}`);
+  const who = msg.from === researcher.did ? 'Researcher' : 'Analyst';
+  console.log(`  ${who}: "${msg.content}"`);
 }
 
-// Clean up
-await analyst.deactivate();
-await reviewer.deactivate();
-} catch (err) {
-  console.error('Error:', err.message);
-  process.exit(1);
-}
+console.log('\n✓ Done — threaded conversation with E2E encryption.');
